@@ -1,0 +1,181 @@
+// server/prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            Int      @id @default(autoincrement())
+  username      String   @unique
+  email         String   @unique
+  password_hash String
+  avatar        String?
+  
+  // Préférences et Localisation
+  region        String   @default("FR") // Ex: "FR", "BE", "CA"
+  interfaceLanguage String @default("fr") // La langue des menus du joueur
+  
+  // Progression
+  global_xp     Int      @default(0)
+  global_level  Int      @default(1)
+  coins         Int      @default(0)
+  
+  createdAt     DateTime @default(now())
+
+  // Relations
+  quizzes       Quiz[]   // Les quiz qu'il a créés
+  stats         UserQuizStat[] // Ses stats sur chaque quiz
+  inventory     Inventory[] // Ses skins
+
+  // Social : Amis (Relation vers soi-même)
+  friendsRequestSent     Friendship[] @relation("Sender")
+  friendsRequestReceived Friendship[] @relation("Receiver")
+
+  // Social : Messages
+  messagesSent     Message[] @relation("MessageSender")
+  messagesReceived Message[] @relation("MessageReceiver")
+}
+
+model Quiz {
+  id          Int      @id @default(autoincrement())
+  title       String
+  description String?
+  
+  // --- NOUVEAUX CHAMPS NETFLIX ---
+  category    String   @default("Autre") // Ex: "Cinéma", "Sport"
+  coverImage  String?  // Une URL vers une image (ex: https://...)
+  // -------------------------------
+
+  language    String   @default("fr")
+  isPublic    Boolean  @default(true)
+  
+  creatorId   Int
+  creator     User     @relation(fields: [creatorId], references: [id])
+  
+  questions   Question[]
+  stats       UserQuizStat[]
+  matches     Match[]
+  
+  createdAt   DateTime @default(now())
+}
+
+model Question {
+  id         Int      @id @default(autoincrement())
+  text       String
+  timeLimit  Int      @default(10) // Temps en secondes
+  quizId     Int
+  quiz       Quiz     @relation(fields: [quizId], references: [id])
+  answers    Answer[]
+}
+
+model Answer {
+  id         Int      @id @default(autoincrement())
+  text       String
+  isCorrect  Boolean
+  questionId Int
+  question   Question @relation(fields: [questionId], references: [id])
+}
+
+// Statistiques précises d'un joueur sur un quiz
+model UserQuizStat {
+  id       Int @id @default(autoincrement())
+  userId   Int
+  quizId   Int
+  xp       Int @default(0)
+  level    Int @default(1)
+  wins     Int @default(0)
+  losses   Int @default(0)
+
+  user     User @relation(fields: [userId], references: [id])
+  quiz     Quiz @relation(fields: [quizId], references: [id])
+
+  @@unique([userId, quizId]) // Unique : 1 seule ligne de stats par quiz par joueur
+}
+
+// Historique des parties (Pour les classements hebdo/mensuel)
+model Match {
+  id             Int      @id @default(autoincrement())
+  quizId         Int
+  player1Id      Int
+  player2Id      Int?     // Null si mode Solo
+  winnerId       Int?     // Null si égalité
+  
+  player1Xp      Int      @default(0)
+  player2Xp      Int      @default(0)
+  
+  playedAt       DateTime @default(now())
+
+  quiz           Quiz     @relation(fields: [quizId], references: [id])
+}
+
+// Social : Amis
+model Friendship {
+  id         Int      @id @default(autoincrement())
+  senderId   Int
+  receiverId Int
+  status     String   @default("PENDING") // PENDING, ACCEPTED, BLOCKED
+  createdAt  DateTime @default(now())
+  
+  sender     User     @relation("Sender", fields: [senderId], references: [id])
+  receiver   User     @relation("Receiver", fields: [receiverId], references: [id])
+
+  @@unique([senderId, receiverId])
+}
+
+// Social : Messages
+model Message {
+  id         Int      @id @default(autoincrement())
+  content    String
+  senderId   Int
+  receiverId Int
+  isRead     Boolean  @default(false)
+  sentAt     DateTime @default(now())
+
+  sender     User     @relation("MessageSender", fields: [senderId], references: [id])
+  receiver   User     @relation("MessageReceiver", fields: [receiverId], references: [id])
+}
+
+// Cosmétique (Skins)
+model Item {
+  id        Int      @id @default(autoincrement())
+  name      String
+  type      String   // AVATAR_FRAME, BACKGROUND...
+  price     Int
+  imageUrl  String
+  inventory Inventory[]
+}
+
+model Inventory {
+  id         Int      @id @default(autoincrement())
+  userId     Int
+  itemId     Int
+  isEquipped Boolean  @default(false)
+  
+  user       User     @relation(fields: [userId], references: [id])
+  item       Item     @relation(fields: [itemId], references: [id])
+}
+
+model ActiveGame {
+  id String @id @default(uuid())
+  quizId Int
+  
+  player1Id Int
+  player1SocketId String? // <--- AJOUTE CETTE LIGNE (Le ? veut dire optionnel)
+  player1Score Int @default(0)
+  player1AnswerIndex Int?
+  
+  player2Id Int?
+  player2Score Int @default(0)
+  player2AnswerIndex Int?
+
+  currentQuestionIndex Int @default(0)
+  roundStartTime DateTime @default(now())
+  
+  status String @default("WAITING")
+  updatedAt DateTime @updatedAt
+}
