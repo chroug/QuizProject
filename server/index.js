@@ -1,4 +1,4 @@
-// server/index.js - GESTION DÉCONNEXION & NETTOYAGE
+// server/index.js - VERSION 8 QUESTIONS ALÉATOIRES
 const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
@@ -19,65 +19,42 @@ const io = new Server(server, {
   cors: { origin: "http://localhost:5173", methods: ["GET", "POST"] }
 });
 
-// --- SOCKET.IO ---
 io.on('connection', (socket) => {
   console.log('🔌 Connecté:', socket.id);
-
-  // On stocke les infos du joueur directement dans le socket pour les retrouver s'il se déconnecte
   socket.on('join_game_room', (gameId) => {
     socket.join(gameId);
-    socket.data.gameId = gameId; // On mémorise l'ID de la partie
-    console.log(`-> Salle ${gameId} rejointe par ${socket.id}`);
+    socket.data.gameId = gameId;
   });
-
-  // GESTION DU DÉPART (Retour arrière ou fermeture onglet)
+  
+  // Nettoyage déconnexion
   socket.on('disconnect', async () => {
-    console.log('Déconnexion:', socket.id);
-    
     const gameId = socket.data.gameId;
     if (gameId) {
         try {
-            // On regarde l'état de la partie
             const game = await prisma.activeGame.findUnique({ where: { id: gameId } });
-            
             if (game && game.status === "WAITING") {
-                // CAS 1 : Il attendait un adversaire et il part -> ON SUPPRIME LA PARTIE
-                // Comme ça, il ne sera plus bloqué !
                 await prisma.activeGame.delete({ where: { id: gameId } });
-                console.log(`🗑️ Partie ${gameId} supprimée (Joueur parti en attente)`);
             }
-            // CAS 2 : La partie était en cours (PLAYING) -> On ne fait rien (pour permettre la reconnexion en cas de refresh)
-        } catch (e) {
-            console.error("Erreur nettoyage disconnect", e);
-        }
+        } catch (e) {}
     }
   });
 
-  // GESTION DU "QUITTER" EXPLICITE (Bouton Quitter)
   socket.on('leave_game', async () => {
       const gameId = socket.data.gameId;
-      if (!gameId) return;
-
-      try {
-          const game = await prisma.activeGame.findUnique({ where: { id: gameId } });
-          if (game) {
-              if (game.status === "WAITING") {
-                  await prisma.activeGame.delete({ where: { id: gameId } });
-              } else if (game.status === "PLAYING") {
-                  // Si on quitte en plein match, on déclare forfait (FINISHED)
-                  await prisma.activeGame.update({ 
-                      where: { id: gameId }, 
-                      data: { status: "FINISHED" } 
-                  });
-                  // On prévient l'adversaire
-                  io.to(gameId).emit('game_update', { ...game, status: "FINISHED" });
-              }
-          }
-      } catch (e) { console.error(e); }
+      if (gameId) {
+         try {
+             const game = await prisma.activeGame.findUnique({ where: { id: gameId } });
+             if (game?.status === "WAITING") await prisma.activeGame.delete({ where: { id: gameId } });
+             if (game?.status === "PLAYING") {
+                 await prisma.activeGame.update({ where: { id: gameId }, data: { status: "FINISHED" } });
+                 io.to(gameId).emit('game_update', { ...game, status: "FINISHED" });
+             }
+         } catch(e){}
+      }
   });
 });
 
-// --- ROUTES API (Authentification & Quiz) ---
+// --- ROUTES AUTH (Inchangées) ---
 app.post('/api/register', async (req, res) => {
     const { username, email, password } = req.body;
     try {
@@ -106,61 +83,73 @@ app.get('/api/quizzes/:id', async (req, res) => {
     res.json(quiz);
 });
 
-// --- MATCHMAKING ---
+// --- API DE JEU ---
+
+// Route simplifiée pour créer le quiz lors de la publication
+app.post('/api/quizzes', async (req, res) => {
+  const { title, description, category, coverImage, creatorId, questions } = req.body;
+  
+  // Petite sécurité : on vérifie qu'il y a des questions
+  if (!questions || questions.length < 1) {
+      return res.status(400).json({ error: "Il faut au moins une question." });
+  }
+
+  try {
+    const newQuiz = await prisma.quiz.create({
+      data: {
+        title, 
+        description, 
+        category: category || "Autre", 
+        coverImage: coverImage || "",
+        creatorId: parseInt(creatorId),
+        questions: {
+          create: questions.map(q => ({
+            text: q.text, 
+            timeLimit: parseInt(q.timeLimit) || 10,
+            answers: { 
+                create: q.answers.map(a => ({ text: a.text, isCorrect: a.isCorrect })) 
+            }
+          }))
+        }
+      }
+    });
+    console.log(`✅ Quiz créé : ${newQuiz.title}`);
+    res.json(newQuiz);
+  } catch (error) {
+    console.error("Erreur création quiz:", error);
+    res.status(500).json({ error: "Impossible de créer le quiz" });
+  }
+});
+
+// 1. JOIN AVEC SÉLECTION ALÉATOIRE
 app.post('/api/game/join', async (req, res) => {
-  // On récupère le socketId envoyé par le client
-  const { userId, quizId, socketId } = req.body; 
+  const { userId, quizId, socketId } = req.body;
   const uId = parseInt(userId);
   const qId = parseInt(quizId);
 
   try {
-    // 1. NETTOYAGE (Comme avant)
+    // Nettoyage anciens
     const alreadyPlaying = await prisma.activeGame.findFirst({
-      where: { 
-        OR: [{ player1Id: uId }, { player2Id: uId }],
-        status: { in: ["WAITING", "PLAYING", "ROUND_SUMMARY"] }
-      }
+      where: { OR: [{ player1Id: uId }, { player2Id: uId }], status: { in: ["WAITING", "PLAYING", "ROUND_SUMMARY"] } }
     });
-
     if (alreadyPlaying) {
-      if (alreadyPlaying.status === "WAITING") {
-          await prisma.activeGame.delete({ where: { id: alreadyPlaying.id } });
-      } else {
-          if (alreadyPlaying.quizId === qId) {
-              const role = (alreadyPlaying.player1Id === uId) ? "player1" : "player2";
-              return res.json({ gameId: alreadyPlaying.id, role, quizId: qId });
-          } else {
-              return res.json({ gameId: alreadyPlaying.id, role: "spectator", quizId: alreadyPlaying.quizId, error: "ALREADY_IN_GAME" });
-          }
-      }
+      if (alreadyPlaying.status === "WAITING") await prisma.activeGame.delete({ where: { id: alreadyPlaying.id } });
+      else return res.json({ error: "ALREADY_IN_GAME", quizId: alreadyPlaying.quizId });
     }
 
-    // 2. RECHERCHE D'ADVERSAIRE (AVEC VÉRIFICATION SOCKET)
-    // On cherche toutes les parties en attente
+    // Recherche partie existante
     const potentialGames = await prisma.activeGame.findMany({
       where: { quizId: qId, status: "WAITING", player1Id: { not: uId } }
     });
 
     let validGame = null;
-
-    // On boucle sur les parties trouvées pour vérifier si le créateur est VRAIMENT là
     for (const game of potentialGames) {
-        // On demande à Socket.io : "Ce socket est-il connecté ?"
         const remoteSocket = io.sockets.sockets.get(game.player1SocketId);
-        
-        if (remoteSocket) {
-            // OUI ! Le joueur est en ligne, on peut rejoindre
-            validGame = game;
-            break; // On a trouvé, on arrête de chercher
-        } else {
-            // NON ! C'est un fantôme (il a changé de page), on supprime cette partie poubelle
-            await prisma.activeGame.delete({ where: { id: game.id } });
-            console.log(`👻 Partie fantôme ${game.id} supprimée (Joueur déconnecté)`);
-        }
+        if (remoteSocket) { validGame = game; break; }
+        else await prisma.activeGame.delete({ where: { id: game.id } });
     }
 
     if (validGame) {
-      // On rejoint la partie valide trouvée
       const startedGame = await prisma.activeGame.update({
         where: { id: validGame.id },
         data: { player2Id: uId, status: "PLAYING", roundStartTime: new Date() }
@@ -169,24 +158,37 @@ app.post('/api/game/join', async (req, res) => {
       return res.json({ gameId: startedGame.id, role: "player2", quizId: qId });
     }
 
-    // 3. CRÉATION (On enregistre MON socketId)
+    // CRÉATION NOUVELLE PARTIE (C'est ici qu'on pioche les 8 questions)
+    // 1. On récupère TOUTES les questions du quiz
+    const quizData = await prisma.quiz.findUnique({
+        where: { id: qId },
+        include: { questions: { include: { answers: true } } }
+    });
+
+    if (!quizData || quizData.questions.length < 8) {
+        return res.status(400).json({ error: "Ce quiz a moins de 8 questions !" });
+    }
+
+    // 2. On mélange et on prend les 8 premières
+    const shuffledQuestions = quizData.questions
+        .sort(() => 0.5 - Math.random())
+        .slice(0, 8);
+
+    // 3. On crée la partie en stockant ces questions
     const newGame = await prisma.activeGame.create({
       data: { 
           quizId: qId, 
           player1Id: uId, 
-          status: "WAITING",
-          player1SocketId: socketId // <--- On sauvegarde ma "ligne téléphonique"
+          status: "WAITING", 
+          player1SocketId: socketId,
+          gameQuestions: shuffledQuestions // STOCKAGE JSON
       }
     });
     res.json({ gameId: newGame.id, role: "player1", quizId: qId });
 
-  } catch (error) {
-    console.error("Erreur Join:", error);
-    res.status(500).json({ error: "Erreur serveur" });
-  }
+  } catch (error) { console.error(error); res.status(500).json({ error: "Erreur serveur" }); }
 });
 
-// --- LOGIQUE DE JEU ---
 app.get('/api/game/:gameId', async (req, res) => {
     const game = await prisma.activeGame.findUnique({ where: { id: req.params.gameId } });
     if (!game) return res.status(404).json({ error: "Introuvable" });
@@ -199,9 +201,27 @@ app.post('/api/game/answer', async (req, res) => {
     const game = await prisma.activeGame.findUnique({ where: { id: gameId } });
     if (!game || game.status === "FINISHED") return res.status(400).send("Trop tard");
 
+    
     const now = new Date();
     const timeTaken = (now - new Date(game.roundStartTime)) / 1000;
-    let points = isCorrect ? Math.round(10 + Math.max(0, 10 - timeTaken)) : 0;
+    
+    // --- NOUVEAU CALCUL DES POINTS ---
+    let points = 0;
+    
+    if (isCorrect) {
+        // Règle : Marge d'1 seconde pour avoir 20 points
+        if (timeTaken <= 1) {
+            points = 20; 
+        } else {
+            // Après 1 seconde, on perd 1 point par seconde supplémentaire
+            // Formule : 20 - (Temps total - 1 seconde gratuite)
+            // Exemple : 3 sec écoulées -> 20 - (3 - 1) = 18 points.
+            // On bloque le minimum à 10 points (pour qu'une bonne réponse vaille toujours au moins qqch)
+            points = Math.round(Math.max(10, 20 - (timeTaken - 1)));
+        }
+    }
+    // ---------------------------------
+
     const isP1 = parseInt(userId) === game.player1Id;
 
     const updatedGame = await prisma.activeGame.update({
@@ -223,10 +243,11 @@ app.post('/api/game/answer', async (req, res) => {
                 io.to(gameId).emit('game_update', summaryGame);
 
                 setTimeout(async () => {
-                    const currentQuiz = await prisma.quiz.findUnique({ where: { id: game.quizId }, include: { questions: true } });
+                    // ON UTILISE LES QUESTIONS DE LA PARTIE, PAS CELLES DU QUIZ GLOBAL
+                    const gameQuestions = summaryGame.gameQuestions; // Récupéré du JSON
                     const nextIndex = summaryGame.currentQuestionIndex + 1;
                     
-                    if (nextIndex >= currentQuiz.questions.length) {
+                    if (nextIndex >= gameQuestions.length) {
                         const finishedGame = await prisma.activeGame.update({ where: { id: gameId }, data: { status: "FINISHED" } });
                         io.to(gameId).emit('game_update', finishedGame);
                     } else {
@@ -245,6 +266,4 @@ app.post('/api/game/answer', async (req, res) => {
 });
 
 const PORT = 3001;
-server.listen(PORT, () => {
-  console.log(`🚀 Serveur PRÊT sur http://localhost:${PORT}`);
-});
+server.listen(PORT, () => { console.log(`🚀 Serveur PRÊT sur http://localhost:${PORT}`); });
